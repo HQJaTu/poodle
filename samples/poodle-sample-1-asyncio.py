@@ -85,10 +85,12 @@ class PoodleClient(POODLE):
                 if really_verbose_debugging:
                     log.debug("PoodleProtocol::connection_lost() FAIL! Didn't receive any data from "
                               "that connection before closing!")
-                self.received_data_future.set_exception(RuntimeError("No data from server!"))
+                if not (self.received_data_future.cancelled() or self.received_data_future.done()):
+                    self.received_data_future.set_exception(RuntimeError("No data from server!"))
             else:
                 # Ok, SecureTCPHandler sent us data
-                self.received_data_future.set_result(True)
+                if not (self.received_data_future.cancelled() or self.received_data_future.done()):
+                    self.received_data_future.set_result(True)
 
     @staticmethod
     def _get_client_ssl_context():
@@ -288,11 +290,16 @@ class MitmTCPHandler(object):
                 self.transport.close()
                 self.client_lock.release()
                 return
+            except asyncio.CancelledError:
+                self.transport.close()
+                self.client_lock.release()
+                return
 
             if self.transport.is_closing():
                 transport.close()
-                log.error('MitmTCPHandler::MitmServerProtocol::connected_to_real_server(), but server connection '
-                          'is gone! Closing this new connection too.')
+                if really_verbose_debugging:
+                    log.error('MitmTCPHandler::MitmServerProtocol::connected_to_real_server(), but server connection '
+                              'is gone! Closing this new connection too.')
             else:
                 self.client_transport = transport
                 if really_verbose_debugging:
@@ -393,6 +400,11 @@ class MitmTCPHandler(object):
             except (TimeoutError, asyncio.TimeoutError):
                 task.cancel()
                 log.error('MitmTCPHandler::MitmServerProtocol::sent_to_real_server() failed to send, timeout')
+                if self.client_transport:
+                    self.client_transport.close()
+                self.transport.close()
+            except asyncio.CancelledError:
+                task.cancel()
                 if self.client_transport:
                     self.client_transport.close()
                 self.transport.close()
